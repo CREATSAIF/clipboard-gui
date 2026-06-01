@@ -1,9 +1,9 @@
 use arboard::Clipboard;
 use chrono::{DateTime, Local};
-use egui::{Label, ScrollArea, TextEdit};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::error::Error as StdError;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,61 +38,54 @@ impl ClipboardItem {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClipboardHistory {
     pub items: VecDeque<ClipboardItem>,
 }
 
-impl Default for ClipboardHistory {
-    fn default() -> Self {
-        Self {
-            items: VecDeque::new(),
+impl ClipboardHistory {
+    pub fn load_from_file() -> Self {
+        let path = storage_path();
+        if let Ok(data) = fs::read_to_string(&path) {
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            Self::default()
         }
     }
+
+    pub fn save_to_file(&self) {
+        let path = storage_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_string_pretty(self) {
+            let _ = fs::write(&path, data);
+        }
+    }
+}
+
+fn storage_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("clipboard-gui")
+        .join(STORAGE_FILE)
 }
 
 pub struct ClipboardManager {
     clipboard: Mutex<Clipboard>,
     history: Mutex<ClipboardHistory>,
     last_content: Mutex<String>,
-    storage_path: PathBuf,
 }
 
 impl ClipboardManager {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let storage_path = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("clipboard-gui")
-            .join(STORAGE_FILE);
-
-        if let Some(parent) = storage_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let history = Self::load_history(&storage_path);
-
+    pub fn new() -> Result<Self, Box<dyn StdError + Send + Sync>> {
+        let clipboard = Clipboard::new()?;
+        let history = ClipboardHistory::load_from_file();
         Ok(Self {
-            clipboard: Mutex::new(Clipboard::new()?),
+            clipboard: Mutex::new(clipboard),
             history: Mutex::new(history),
             last_content: Mutex::new(String::new()),
-            storage_path,
         })
-    }
-
-    fn load_history(path: &PathBuf) -> ClipboardHistory {
-        if let Ok(data) = fs::read_to_string(path) {
-            if let Ok(h) = serde_json::from_str::<ClipboardHistory>(&data) {
-                return h;
-            }
-        }
-        ClipboardHistory::default()
-    }
-
-    fn save_history(&self) {
-        let history = self.history.lock();
-        if let Ok(data) = serde_json::to_string_pretty(&*history) {
-            let _ = fs::write(&self.storage_path, data);
-        }
     }
 
     pub fn poll(&self) -> Option<ClipboardItem> {
@@ -106,18 +99,11 @@ impl ClipboardManager {
 
                 let item = ClipboardItem::new(content);
                 let mut history = self.history.lock();
-                if let Some(existing) = history.items.iter().find(|i| i.content == item.content) {
-                    drop(history);
-                    let mut h = self.history.lock();
-                    let idx = h
-                        .items
-                        .iter()
-                        .position(|i| i.content == item.content)
-                        .unwrap();
-                    let mut updated = existing.clone();
+                if let Some(idx) = history.items.iter().position(|i| i.content == item.content) {
+                    let mut updated = history.items[idx].clone();
                     updated.timestamp = Local::now();
-                    h.items.remove(idx);
-                    h.items.push_front(updated);
+                    history.items.remove(idx);
+                    history.items.push_front(updated);
                 } else {
                     if history.items.len() >= MAX_HISTORY {
                         history.items.pop_back();
@@ -132,9 +118,9 @@ impl ClipboardManager {
         None
     }
 
-    pub fn copy_to_clipboard(&self, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn copy_to_clipboard(&self, content: &str) -> Result<(), Box<dyn StdError + Send + Sync>> {
         let mut clipboard = self.clipboard.lock();
-        clipboard.set_text(content.to_string());
+        clipboard.set_text(content.to_string())?;
         let mut last = self.last_content.lock();
         *last = content.to_string();
         Ok(())
@@ -159,6 +145,11 @@ impl ClipboardManager {
             self.save_history();
         }
     }
+
+    fn save_history(&self) {
+        let history = self.history.lock();
+        history.save_to_file();
+    }
 }
 
 struct App {
@@ -170,7 +161,7 @@ struct App {
 }
 
 impl App {
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    fn new() -> Result<Self, Box<dyn StdError + Send + Sync>> {
         let manager = Arc::new(ClipboardManager::new()?);
         let mgr_clone = Arc::clone(&manager);
 
@@ -193,12 +184,9 @@ impl App {
         if self.search_query.is_empty() {
             all
         } else {
+            let q = self.search_query.to_lowercase();
             all.into_iter()
-                .filter(|item| {
-                    item.content
-                        .to_lowercase()
-                        .contains(&self.search_query.to_lowercase())
-                })
+                .filter(|item| item.content.to_lowercase().contains(&q))
                 .collect()
         }
     }
@@ -222,13 +210,15 @@ impl eframe::App for App {
 
             ui.horizontal(|ui| {
                 ui.label("Search:");
-                TextEdit::singleline(&mut self.search_query)
-                    .placeholder_text("Filter clipboard history...")
-                    .ui(ui);
-                if !self.search_query.is_empty() {
-                    if ui.button("✕").clicked() {
-                        self.search_query.clear();
-                    }
+                let mut query = self.search_query.clone();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut query).hint_text("Filter clipboard history..."),
+                );
+                if response.changed() {
+                    self.search_query = query;
+                }
+                if !self.search_query.is_empty() && ui.button("✕").clicked() {
+                    self.search_query.clear();
                 }
             });
 
@@ -237,80 +227,70 @@ impl eframe::App for App {
             if items.is_empty() {
                 ui.label("No clipboard items yet. Copy something to get started!");
             } else {
-                ScrollArea::vertical()
+                egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (i, item) in items.iter().enumerate() {
+                        for (i, item) in items.iter().cloned().enumerate() {
                             let is_selected = self.selected_index == Some(i);
-                            let frame = egui::Frame::default()
-                                .fill(if is_selected {
-                                    egui::Color32::from_rgba_unmultiplied(50, 100, 150, 40)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                })
+                            let fill_color = if is_selected {
+                                egui::Color32::from_rgba_unmultiplied(50, 100, 150, 40)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+
+                            egui::Frame::none()
+                                .fill(fill_color)
                                 .inner_margin(8.0)
-                                .rounding(4.0);
-
-                            egui::Frame::fill(ui.style(), frame).show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let time_str = item.timestamp.format("%H:%M:%S").to_string();
-                                    ui.label(egui::RichText::new(time_str).small().weak());
-                                    ui.separator();
-                                    ui.label(format!("{} chars", item.char_count));
-                                    ui.separator();
-                                    ui.label(
-                                        egui::RichText::new(item.preview.replace('\n', " "))
-                                            .monospace(),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui.button("📋 Copy").clicked() {
-                                                let _ =
-                                                    self.manager.copy_to_clipboard(&item.content);
-                                            }
-                                            if ui.button("🗑").clicked() {
-                                                self.manager.delete_item(i);
-                                                if self.selected_index == Some(i) {
-                                                    self.selected_index = None;
+                                .rounding(4.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let time_str =
+                                            item.timestamp.format("%H:%M:%S").to_string();
+                                        ui.label(egui::RichText::new(time_str).small().weak());
+                                        ui.separator();
+                                        ui.label(format!("{} chars", item.char_count));
+                                        ui.separator();
+                                        ui.label(
+                                            egui::RichText::new(item.preview.replace('\n', " "))
+                                                .monospace(),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("📋 Copy").clicked() {
+                                                    let _ = self
+                                                        .manager
+                                                        .copy_to_clipboard(&item.content);
                                                 }
-                                                return;
-                                            }
-                                            if ui.button("👁").clicked() {
-                                                self.show_preview = if self.show_preview == Some(i)
-                                                {
-                                                    None
-                                                } else {
-                                                    Some(i)
-                                                };
-                                            }
-                                        },
-                                    );
-                                });
-
-                                if self.show_preview == Some(i) {
-                                    ui.add_space(4.0);
-                                    ui.separator();
-                                    TextEdit::multiline().frame(false).show(ui, |ui| {
-                                        ui.label(item.content.clone());
+                                                if ui.button("🗑").clicked() {
+                                                    self.manager.delete_item(i);
+                                                    if self.selected_index == Some(i) {
+                                                        self.selected_index = None;
+                                                    }
+                                                }
+                                                if ui.button("👁").clicked() {
+                                                    self.show_preview =
+                                                        if self.show_preview == Some(i) {
+                                                            None
+                                                        } else {
+                                                            Some(i)
+                                                        };
+                                                }
+                                            },
+                                        );
                                     });
-                                }
-                            });
+
+                                    if self.show_preview == Some(i) {
+                                        ui.add_space(4.0);
+                                        ui.separator();
+                                        ui.label(egui::RichText::new(&item.content).monospace());
+                                    }
+                                });
 
                             ui.add_space(4.0);
 
-                            if ui
-                                .input()
-                                .pointer
-                                .button_clicked(egui::PointerButton::Primary)
-                            {
-                                if ui.layout().rect.contains(ui.input().pointer.interact_pos()) {
-                                    if self.selected_index == Some(i) {
-                                        let _ = self.manager.copy_to_clipboard(&item.content);
-                                    } else {
-                                        self.selected_index = Some(i);
-                                    }
-                                }
+                            if ui.button(format!("Select #{}", i)).clicked() {
+                                self.selected_index = Some(i);
                             }
                         }
                     });
@@ -320,13 +300,13 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("{} items", items.len())).weak());
                 ui.separator();
-                ui.label(egui::RichText::new("Press Enter to copy selected").weak());
+                ui.label(egui::RichText::new("Click '📋 Copy' to copy an item").weak());
             });
         });
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn StdError + Send + Sync>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
@@ -339,7 +319,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "Clipboard Manager",
         options,
-        Box::new(|_| Ok(Box::new(App::new()?))),
+        Box::new(|_cc| Ok(Box::new(App::new()?))),
     )
-    .map_err(|e| e.into())
+    .map_err(|e| -> Box<dyn StdError + Send + Sync> {
+        Box::new(std::io::Error::other(e.to_string()))
+    })
 }
